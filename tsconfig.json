@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
+    "strict": true,
+    "moduleResolution": "bundler",
+    "target": "esnext",
+    "module": "esnext"
+  }
+}
