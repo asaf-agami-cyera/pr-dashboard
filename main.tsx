@@ -79,6 +79,11 @@ interface GHCheckRun {
   state?: string
 }
 
+interface GHReviewRequest {
+  __typename: string
+  login?: string
+}
+
 interface GHPullRequest {
   number: number
   title: string
@@ -86,6 +91,7 @@ interface GHPullRequest {
   headRefName: string
   isDraft: boolean
   reviewDecision: string
+  reviewRequests: GHReviewRequest[]
   reviews: GHReview[]
   statusCheckRollup: GHCheckRun[]
   createdAt: string
@@ -102,6 +108,7 @@ function classifyPR(pr: GHPullRequest): PRStatus {
   if (pr.isDraft) return "draft"
   if (pr.reviewDecision === "APPROVED") return "approved"
   if (pr.reviewDecision === "CHANGES_REQUESTED") return "changes_requested"
+  if (pr.reviewRequests.length > 0) return "waiting_for_review"
 
   const humanReviews = pr.reviews.filter(
     (r) => r.authorAssociation !== "NONE" && r.author.login !== SELF_LOGIN,
@@ -177,6 +184,7 @@ async function fetchPRData(): Promise<PR[]> {
     "headRefName",
     "isDraft",
     "reviewDecision",
+    "reviewRequests",
     "reviews",
     "statusCheckRollup",
     "createdAt",
