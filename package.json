@@ -2,6 +2,9 @@
   "name": "pr-dashboard",
   "version": "1.0.0",
   "private": true,
+  "scripts": {
+    "start": "bun main.tsx"
+  },
   "dependencies": {
     "@opentui/core": "latest",
     "@opentui/solid": "latest",

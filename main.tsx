@@ -100,9 +100,40 @@ interface GHPullRequest {
 }
 
 // ─── Data ─────────────────────────────────────────────────────────
-const REPO = "genie-security/genie"
-const SELF_LOGIN = "asaf-genie"
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000
+
+interface Config {
+  repo: string
+  selfLogin: string
+}
+
+function readArgValue(name: string): string | undefined {
+  const prefix = `${name}=`
+  for (let i = 2; i < Bun.argv.length; i++) {
+    const arg = Bun.argv.at(i)
+    if (!arg) continue
+    if (arg === name) return Bun.argv.at(i + 1)
+    if (arg.startsWith(prefix)) return arg.slice(prefix.length)
+  }
+  return undefined
+}
+
+function readConfig(): Config {
+  const repo = readArgValue("--repo") ?? Bun.env.PR_DASHBOARD_REPO
+  const selfLogin = readArgValue("--self-login") ?? Bun.env.PR_DASHBOARD_SELF_LOGIN
+
+  if (!repo || !selfLogin) {
+    throw new Error(
+      "Missing config. Set PR_DASHBOARD_REPO and PR_DASHBOARD_SELF_LOGIN, or pass --repo owner/name --self-login username.",
+    )
+  }
+
+  return { repo, selfLogin }
+}
+
+const config = readConfig()
+const REPO = config.repo
+const SELF_LOGIN = config.selfLogin
 
 function classifyPR(pr: GHPullRequest): PRStatus {
   if (pr.isDraft) return "draft"
@@ -414,7 +445,7 @@ function Header(props: {
         <text fg={theme.accent} attributes={TextAttributes.BOLD}>
           PR Dashboard
         </text>
-        <text fg={theme.dimmed}>genie-security/genie</text>
+        <text fg={theme.dimmed}>{REPO}</text>
       </box>
       <box flexDirection="row" gap={2}>
         <Show when={props.reviewCount > 0}>
