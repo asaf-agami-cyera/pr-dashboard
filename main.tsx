@@ -1,5 +1,5 @@
 import { createCliRenderer, TextAttributes } from "@opentui/core"
-import { render, useKeyboard } from "@opentui/solid"
+import { render, useKeyboard, useRenderer } from "@opentui/solid"
 import { createSignal, createMemo, For, Show, onCleanup, batch } from "solid-js"
 
 // ─── Theme ────────────────────────────────────────────────────────
@@ -747,8 +747,20 @@ function App() {
   })
 
   // Keyboard
+  const renderer = useRenderer()
+
+  // `q` used to call process.exit(0) on its own, which never gave OpenTUI the
+  // chance to switch the terminal back out of its alternate screen, so fragments
+  // of the dashboard were left behind in the scrollback. destroy() hands the
+  // terminal back; the explicit exit then guarantees the shell returns straight
+  // away rather than waiting on the refresh timer or an in-flight `gh` call.
+  const quit = () => {
+    renderer.destroy()
+    process.exit(0)
+  }
+
   useKeyboard((key) => {
-    if (key.name === "q") process.exit(0)
+    if (key.name === "q") return quit()
     if (key.name === "r") refresh()
 
     if (key.name === "o") {
