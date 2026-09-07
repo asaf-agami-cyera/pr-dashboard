@@ -1,6 +1,7 @@
 import { createCliRenderer, TextAttributes } from "@opentui/core"
 import { render, useKeyboard, useRenderer } from "@opentui/solid"
 import { createSignal, createMemo, For, Show, onCleanup, batch } from "solid-js"
+import { mergedSearch, recentMerges } from "./recent-merges"
 
 // ─── Theme ────────────────────────────────────────────────────────
 const theme = {
@@ -31,6 +32,7 @@ type PRStatus =
   | "reviewed"
   | "changes_requested"
   | "approved"
+  | "merged"
 
 type CIStatus = "passing" | "failing" | "pending" | "unknown"
 
@@ -48,6 +50,7 @@ interface PR {
   createdAt: string
   updatedAt: string
   status: PRStatus
+  mergedAt?: string | null
   ciStatus: CIStatus
   humanReviews: ReviewInfo[]
 }
@@ -97,6 +100,7 @@ interface GHPullRequest {
   createdAt: string
   updatedAt: string
   author?: { login: string }
+  mergedAt?: string | null
 }
 
 // ─── Data ─────────────────────────────────────────────────────────
@@ -136,6 +140,7 @@ const REPO = config.repo
 const SELF_LOGIN = config.selfLogin
 
 function classifyPR(pr: GHPullRequest): PRStatus {
+  if (pr.mergedAt) return "merged"
   if (pr.isDraft) return "draft"
   if (pr.reviewDecision === "APPROVED") return "approved"
   if (pr.reviewDecision === "CHANGES_REQUESTED") return "changes_requested"
@@ -201,13 +206,15 @@ function parsePRs(raw: GHPullRequest[]): PR[] {
     headRefName: pr.headRefName,
     createdAt: pr.createdAt,
     updatedAt: pr.updatedAt,
+    mergedAt: pr.mergedAt,
     status: classifyPR(pr),
     ciStatus: deriveCIStatus(pr.statusCheckRollup),
     humanReviews: getHumanReviews(pr),
   }))
 }
 
-async function fetchPRData(): Promise<PR[]> {
+async function fetchPRData(state: "open" | "merged" = "open"): Promise<PR[]> {
+  const now = Date.now()
   const fields = [
     "number",
     "title",
@@ -220,6 +227,7 @@ async function fetchPRData(): Promise<PR[]> {
     "statusCheckRollup",
     "createdAt",
     "updatedAt",
+    "mergedAt",
   ].join(",")
 
   const proc = Bun.spawn(
@@ -232,25 +240,28 @@ async function fetchPRData(): Promise<PR[]> {
       "--author",
       "@me",
       "--state",
-      "open",
+      state,
+      ...(state === "merged" ? ["--search", mergedSearch(now)] : []),
       "--json",
       fields,
       "--limit",
-      "50",
+      state === "merged" ? "1000" : "50",
     ],
     { stdout: "pipe", stderr: "pipe" },
   )
 
-  const stdout = await new Response(proc.stdout).text()
-  const stderr = await new Response(proc.stderr).text()
-  const exitCode = await proc.exited
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
 
   if (exitCode !== 0) {
     throw new Error(`gh failed (exit ${exitCode}): ${stderr}`)
   }
 
   const raw: GHPullRequest[] = JSON.parse(stdout)
-  return parsePRs(raw)
+  return parsePRs(state === "merged" ? recentMerges(raw, now) : raw)
 }
 
 const REVIEWER_FIELDS = [
@@ -366,6 +377,7 @@ const statusLabels: Record<PRStatus, string> = {
   reviewed: "Reviewed",
   changes_requested: "Changes Requested",
   approved: "Approved",
+  merged: "Merged · last 3 days",
 }
 
 const statusColors: Record<PRStatus, string> = {
@@ -374,6 +386,7 @@ const statusColors: Record<PRStatus, string> = {
   reviewed: theme.reviewed,
   changes_requested: theme.changesRequested,
   approved: theme.approved,
+  merged: theme.accent,
 }
 
 const statusOrder: PRStatus[] = [
@@ -382,6 +395,7 @@ const statusOrder: PRStatus[] = [
   "waiting_for_review",
   "approved",
   "draft",
+  "merged",
 ]
 
 function ciIcon(ci: CIStatus): string {
@@ -428,6 +442,7 @@ function reviewStateLabel(state: string): string {
 // ─── Components ───────────────────────────────────────────────────
 function Header(props: {
   prCount: number
+  mergedCount: number
   reviewCount: number
   reviewedByMeCount: number
   lastRefresh: string
@@ -470,6 +485,14 @@ function Header(props: {
           </text>
           <text fg={theme.dimmed}>open</text>
         </box>
+        <Show when={props.mergedCount > 0}>
+          <box flexDirection="row" gap={1}>
+            <text fg={theme.accent} attributes={TextAttributes.BOLD}>
+              {String(props.mergedCount)}
+            </text>
+            <text fg={theme.dimmed}>merged</text>
+          </box>
+        </Show>
         <Show when={props.loading}>
           <text fg={theme.warning}>refreshing...</text>
         </Show>
@@ -511,10 +534,16 @@ function PRRow(props: { pr: PR; selected: boolean }) {
           {props.pr.title}
         </text>
         <box flexGrow={1} />
-        <CIBadge ci={props.pr.ciStatus} />
-        <text fg={theme.dimmed}>{relativeTime(props.pr.updatedAt)}</text>
+        <Show when={props.pr.status !== "merged"}>
+          <CIBadge ci={props.pr.ciStatus} />
+        </Show>
+        <text fg={theme.dimmed}>
+          {props.pr.mergedAt
+            ? `merged ${relativeTime(props.pr.mergedAt)}`
+            : relativeTime(props.pr.updatedAt)}
+        </text>
       </box>
-      <Show when={props.pr.humanReviews.length > 0}>
+      <Show when={props.pr.status !== "merged" && props.pr.humanReviews.length > 0}>
         <For each={props.pr.humanReviews}>
           {(review) => (
             <box flexDirection="row" paddingX={5} gap={1}>
@@ -664,7 +693,7 @@ function ErrorBanner(props: { message: string }) {
 function EmptyState() {
   return (
     <box justifyContent="center" alignItems="center" flexGrow={1}>
-      <text fg={theme.dimmed}>No open PRs found.</text>
+      <text fg={theme.dimmed}>No open or recently merged PRs found.</text>
     </box>
   )
 }
@@ -683,24 +712,30 @@ function App() {
     setLoading(true)
     setError("")
     try {
-      const [myPRs, reviewRequested, reviewedBy] = await Promise.all([
+      const [myPRs, reviewRequested, reviewedBy, mergedPRs] = await Promise.all([
         fetchPRData(),
         fetchReviewRequestedPRs(),
         fetchReviewedByMePRs(),
+        fetchPRData("merged"),
       ])
+      // A PR can merge between the concurrent queries; prefer its merged snapshot.
+      const mergedNumbers = new Set(mergedPRs.map((pr) => pr.number))
+      const authoredPRs = [...myPRs.filter((pr) => !mergedNumbers.has(pr.number)), ...mergedPRs]
 
       // Deduplicate: remove from "reviewed by me" anything that's in
       // "needs my review" (re-requested) or authored by me
       const needsReviewNumbers = new Set(reviewRequested.map((pr) => pr.number))
-      const myPRNumbers = new Set(myPRs.map((pr) => pr.number))
+      const myPRNumbers = new Set(authoredPRs.map((pr) => pr.number))
       const dedupedReviewedByMe = reviewedBy.filter(
         (pr) => !needsReviewNumbers.has(pr.number) && !myPRNumbers.has(pr.number),
       )
 
       batch(() => {
-        setPrs(myPRs)
+        setPrs(authoredPRs)
         setNeedsMyReview(reviewRequested)
         setReviewedByMe(dedupedReviewedByMe)
+        const count = authoredPRs.length + reviewRequested.length + dedupedReviewedByMe.length
+        setSelectedIndex((i) => Math.min(i, Math.max(0, count - 1)))
         setLastRefresh(new Date().toLocaleTimeString())
         setLoading(false)
       })
@@ -727,7 +762,8 @@ function App() {
     return groups
   })
 
-  const totalPRs = createMemo(() => prs().length)
+  const totalPRs = createMemo(() => prs().filter((pr) => pr.status !== "merged").length)
+  const totalMerged = createMemo(() => prs().filter((pr) => pr.status === "merged").length)
   const totalItems = createMemo(
     () => needsMyReview().length + reviewedByMe().length + prs().length,
   )
@@ -798,6 +834,7 @@ function App() {
     >
       <Header
         prCount={totalPRs()}
+        mergedCount={totalMerged()}
         reviewCount={needsMyReview().length}
         reviewedByMeCount={reviewedByMe().length}
         lastRefresh={lastRefresh()}
