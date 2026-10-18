@@ -1,7 +1,29 @@
 import { createCliRenderer, TextAttributes } from "@opentui/core"
 import { render, useKeyboard, useRenderer } from "@opentui/solid"
 import { createSignal, createMemo, For, Show, onCleanup, batch } from "solid-js"
+import type { CIStatus, PR, PRStatus, ReviewInfo, ReviewerPR } from "./model"
 import { mergedSearch, recentMerges } from "./recent-merges"
+import {
+  assignStackSlots,
+  buildRows,
+  effectiveSelection,
+  isOpen,
+  parseStacks,
+  prRows,
+  slotLetter,
+  stackChain,
+  stackQuery,
+  type DashboardData,
+  type GHStackResponse,
+  type MemberStatus,
+  type PRRow,
+  type Row,
+  type Selection,
+  type Stack,
+  type StackIndex,
+  type StackSummary,
+  type View,
+} from "./stacks"
 
 // ─── Theme ────────────────────────────────────────────────────────
 const theme = {
@@ -12,6 +34,7 @@ const theme = {
   accentDim: "#5b21b6",
   text: "#e6edf3",
   dimmed: "#8b949e",
+  faint: "#5c6470",
   success: "#3fb950",
   warning: "#d29922",
   error: "#f85149",
@@ -23,51 +46,10 @@ const theme = {
   waiting: "#58a6ff",
   reviewNeeded: "#f0883e",
   reviewedByMe: "#39d353",
+  stacks: ["#56d4dd", "#f778ba", "#d2a8ff", "#e6c07b", "#ffa198", "#7ee7c7"],
 }
 
 // ─── Types ────────────────────────────────────────────────────────
-type PRStatus =
-  | "draft"
-  | "waiting_for_review"
-  | "reviewed"
-  | "changes_requested"
-  | "approved"
-  | "merged"
-
-type CIStatus = "passing" | "failing" | "pending" | "unknown"
-
-interface ReviewInfo {
-  login: string
-  state: string
-  submittedAt: string
-}
-
-interface PR {
-  number: number
-  title: string
-  url: string
-  headRefName: string
-  createdAt: string
-  updatedAt: string
-  status: PRStatus
-  mergedAt?: string | null
-  ciStatus: CIStatus
-  humanReviews: ReviewInfo[]
-}
-
-interface ReviewerPR {
-  number: number
-  title: string
-  url: string
-  headRefName: string
-  createdAt: string
-  updatedAt: string
-  author: string
-  isDraft: boolean
-  ciStatus: CIStatus
-  myReviewState?: string // "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" etc. — only for "reviewed by me"
-}
-
 interface GHReview {
   author: { login: string }
   authorAssociation: string
@@ -105,6 +87,7 @@ interface GHPullRequest {
 
 // ─── Data ─────────────────────────────────────────────────────────
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000
+const STACK_QUERY_CHUNK = 40
 
 interface Config {
   repo: string
@@ -138,6 +121,21 @@ function readConfig(): Config {
 const config = readConfig()
 const REPO = config.repo
 const SELF_LOGIN = config.selfLogin
+
+async function runGh(args: string[]): Promise<string> {
+  const proc = Bun.spawn(["gh", ...args], { stdout: "pipe", stderr: "pipe" })
+
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
+
+  if (exitCode !== 0) {
+    throw new Error(`gh failed (exit ${exitCode}): ${stderr}`)
+  }
+  return stdout
+}
 
 function classifyPR(pr: GHPullRequest): PRStatus {
   if (pr.mergedAt) return "merged"
@@ -230,35 +228,21 @@ async function fetchPRData(state: "open" | "merged" = "open"): Promise<PR[]> {
     "mergedAt",
   ].join(",")
 
-  const proc = Bun.spawn(
-    [
-      "gh",
-      "pr",
-      "list",
-      "--repo",
-      REPO,
-      "--author",
-      "@me",
-      "--state",
-      state,
-      ...(state === "merged" ? ["--search", mergedSearch(now)] : []),
-      "--json",
-      fields,
-      "--limit",
-      state === "merged" ? "1000" : "50",
-    ],
-    { stdout: "pipe", stderr: "pipe" },
-  )
-
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
+  const stdout = await runGh([
+    "pr",
+    "list",
+    "--repo",
+    REPO,
+    "--author",
+    "@me",
+    "--state",
+    state,
+    ...(state === "merged" ? ["--search", mergedSearch(now)] : []),
+    "--json",
+    fields,
+    "--limit",
+    state === "merged" ? "1000" : "50",
   ])
-
-  if (exitCode !== 0) {
-    throw new Error(`gh failed (exit ${exitCode}): ${stderr}`)
-  }
 
   const raw: GHPullRequest[] = JSON.parse(stdout)
   return parsePRs(state === "merged" ? recentMerges(raw, now) : raw)
@@ -307,54 +291,37 @@ function parseReviewerPRs(
   })
 }
 
-async function fetchReviewRequestedPRs(): Promise<ReviewerPR[]> {
-  const proc = Bun.spawn(
-    [
-      "gh", "pr", "list",
-      "--repo", REPO,
-      "--search", "review-requested:@me",
-      "--state", "open",
-      "--json", REVIEWER_FIELDS,
-      "--limit", "50",
-    ],
-    { stdout: "pipe", stderr: "pipe" },
-  )
-
-  const stdout = await new Response(proc.stdout).text()
-  const stderr = await new Response(proc.stderr).text()
-  const exitCode = await proc.exited
-
-  if (exitCode !== 0) {
-    throw new Error(`gh failed (exit ${exitCode}): ${stderr}`)
-  }
+async function fetchReviewerPRs(search: string, includeMyReviewState: boolean): Promise<ReviewerPR[]> {
+  const stdout = await runGh([
+    "pr", "list",
+    "--repo", REPO,
+    "--search", search,
+    "--state", "open",
+    "--json", REVIEWER_FIELDS,
+    "--limit", "50",
+  ])
 
   const raw: GHPullRequest[] = JSON.parse(stdout)
-  return parseReviewerPRs(raw, { includeMyReviewState: false })
+  return parseReviewerPRs(raw, { includeMyReviewState })
 }
 
-async function fetchReviewedByMePRs(): Promise<ReviewerPR[]> {
-  const proc = Bun.spawn(
-    [
-      "gh", "pr", "list",
-      "--repo", REPO,
-      "--search", "reviewed-by:@me",
-      "--state", "open",
-      "--json", REVIEWER_FIELDS,
-      "--limit", "50",
-    ],
-    { stdout: "pipe", stderr: "pipe" },
-  )
+const fetchReviewRequestedPRs = () => fetchReviewerPRs("review-requested:@me", false)
+const fetchReviewedByMePRs = () => fetchReviewerPRs("reviewed-by:@me", true)
 
-  const stdout = await new Response(proc.stdout).text()
-  const stderr = await new Response(proc.stderr).text()
-  const exitCode = await proc.exited
-
-  if (exitCode !== 0) {
-    throw new Error(`gh failed (exit ${exitCode}): ${stderr}`)
+// `gh pr list --json` has no stack fields, so stack membership comes from GraphQL.
+async function fetchStacks(numbers: number[]): Promise<StackIndex> {
+  const chunks: number[][] = []
+  for (let i = 0; i < numbers.length; i += STACK_QUERY_CHUNK) {
+    chunks.push(numbers.slice(i, i + STACK_QUERY_CHUNK))
   }
-
-  const raw: GHPullRequest[] = JSON.parse(stdout)
-  return parseReviewerPRs(raw, { includeMyReviewState: true })
+  const responses = await Promise.all(
+    chunks.map(async (chunk) => {
+      const stdout = await runGh(["api", "graphql", "-f", `query=${stackQuery(REPO, chunk)}`])
+      const response: GHStackResponse = JSON.parse(stdout)
+      return response
+    }),
+  )
+  return parseStacks(responses)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -389,14 +356,25 @@ const statusColors: Record<PRStatus, string> = {
   merged: theme.accent,
 }
 
-const statusOrder: PRStatus[] = [
-  "changes_requested",
-  "reviewed",
-  "waiting_for_review",
-  "approved",
-  "draft",
-  "merged",
-]
+const memberLabels: Record<MemberStatus, string> = {
+  draft: "draft",
+  waiting_for_review: "waiting",
+  reviewed: "reviewed",
+  changes_requested: "changes",
+  approved: "approved",
+  merged: "merged",
+  closed: "closed",
+}
+
+function memberColor(status: MemberStatus): string {
+  return status === "closed" ? theme.dimmed : statusColors[status]
+}
+
+const summaryText: Record<StackSummary, { text: string; color: string }> = {
+  blocked_changes: { text: "blocked: changes requested", color: theme.error },
+  blocked_ci: { text: "blocked: CI failing", color: theme.error },
+  ready: { text: "bottom ready to merge", color: theme.success },
+}
 
 function ciIcon(ci: CIStatus): string {
   switch (ci) {
@@ -439,6 +417,15 @@ function reviewStateLabel(state: string): string {
   }
 }
 
+function truncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`
+}
+
+interface StackSlot {
+  letter: string
+  color: string
+}
+
 // ─── Components ───────────────────────────────────────────────────
 function Header(props: {
   prCount: number
@@ -447,6 +434,7 @@ function Header(props: {
   reviewedByMeCount: number
   lastRefresh: string
   loading: boolean
+  view: View
 }) {
   return (
     <box
@@ -461,6 +449,9 @@ function Header(props: {
           PR Dashboard
         </text>
         <text fg={theme.dimmed}>{REPO}</text>
+        <text fg="#fff" bg={theme.accent}>
+          {` ${props.view} view `}
+        </text>
       </box>
       <box flexDirection="row" gap={2}>
         <Show when={props.reviewCount > 0}>
@@ -512,157 +503,271 @@ function CIBadge(props: { ci: CIStatus }) {
   )
 }
 
-function PRRow(props: { pr: PR; selected: boolean }) {
-  const bgColor = props.selected ? theme.surface : theme.bg
+interface RowContext {
+  view: () => View
+  selected: () => PRRow | undefined
+  slot: (stack: Stack) => StackSlot
+}
+
+function StatusPill(props: { status: MemberStatus }) {
+  return <text fg={memberColor(props.status)}>{memberLabels[props.status].padEnd(8)}</text>
+}
+
+function PRRowView(props: { row: PRRow; ctx: RowContext }) {
+  const row = props.row
+  const item = row.item
+  const isSelected = () => props.ctx.selected()?.key === row.key
+  const isSibling = () => {
+    const sel = props.ctx.selected()
+    return (
+      props.ctx.view() === "status" &&
+      !isSelected() &&
+      row.stack !== undefined &&
+      sel?.section === row.section &&
+      sel.stack?.stack.number === row.stack.stack.number
+    )
+  }
+  const slot = () => (row.stack ? props.ctx.slot(row.stack.stack) : undefined)
+  const ghost = item.source === "ghost"
+  const merged =
+    (item.source === "mine" && item.pr.status === "merged") ||
+    (item.source === "ghost" && item.member.status === "merged")
+  const title = item.source === "ghost" ? item.member.title : item.pr.title
+  const reviews = item.source === "mine" && !merged ? item.pr.humanReviews : []
+  const reviewPad = () => (props.ctx.view() === "stack" ? 8 : 5)
 
   return (
-    <box flexDirection="column" backgroundColor={bgColor}>
+    <box flexDirection="column" backgroundColor={isSelected() ? theme.surface : theme.bg}>
       <box flexDirection="row" gap={1} paddingX={2}>
-        <Show when={props.selected}>
+        <Show when={isSelected()}>
           <text fg={theme.accent} attributes={TextAttributes.BOLD}>
             {">"}
           </text>
         </Show>
-        <Show when={!props.selected}>
-          <text fg={theme.bg}>{" "}</text>
+        <Show when={!isSelected()}>
+          <text fg={isSibling() ? (slot()?.color ?? theme.bg) : theme.bg} attributes={TextAttributes.BOLD}>
+            {isSibling() ? "┃" : " "}
+          </text>
         </Show>
-        <text fg={theme.dimmed}>#{String(props.pr.number)}</text>
-        <text
-          fg={props.selected ? theme.text : theme.text}
-          attributes={props.selected ? TextAttributes.BOLD : 0}
-        >
-          {props.pr.title}
-        </text>
-        <box flexGrow={1} />
-        <Show when={props.pr.status !== "merged"}>
-          <CIBadge ci={props.pr.ciStatus} />
+        <Show when={props.ctx.view() === "stack"}>
+          <text fg={ghost ? theme.faint : (slot()?.color ?? theme.bg)}>
+            {row.stack ? String(row.stack.position).padStart(2) : "  "}
+          </text>
+          <Show when={merged}>
+            <text fg={theme.accent}>✓</text>
+          </Show>
         </Show>
-        <text fg={theme.dimmed}>
-          {props.pr.mergedAt
-            ? `merged ${relativeTime(props.pr.mergedAt)}`
-            : relativeTime(props.pr.updatedAt)}
-        </text>
-      </box>
-      <Show when={props.pr.status !== "merged" && props.pr.humanReviews.length > 0}>
-        <For each={props.pr.humanReviews}>
-          {(review) => (
-            <box flexDirection="row" paddingX={5} gap={1}>
-              <text fg={theme.dimmed}>{"└"}</text>
-              <text fg={theme.info}>{review.login}</text>
-              <text fg={theme.dimmed}>
-                {reviewStateLabel(review.state)} {relativeTime(review.submittedAt)}
-              </text>
-            </box>
+        <text fg={ghost ? theme.faint : theme.dimmed}>#{String(row.number)}</text>
+        <Show when={props.ctx.view() === "status" && row.stack}>
+          {(stack) => (
+            <text fg={slot()?.color ?? theme.dimmed}>
+              {`▌${slot()?.letter ?? "?"} ${stack().position}/${stack().stack.members.length}`}
+            </text>
           )}
-        </For>
+        </Show>
+        <text
+          fg={ghost ? theme.faint : theme.text}
+          attributes={isSelected() ? TextAttributes.BOLD : 0}
+        >
+          {title}
+        </text>
+        <Show when={row.startHere && props.ctx.view() === "stack"}>
+          <text fg={theme.reviewNeeded}>← start here</text>
+        </Show>
+        <box flexGrow={1} />
+        <PRRowRight row={row} ctx={props.ctx} />
+      </box>
+      <For each={reviews}>
+        {(review) => (
+          <box flexDirection="row" paddingLeft={reviewPad()} gap={1}>
+            <text fg={theme.dimmed}>{"└"}</text>
+            <text fg={theme.info}>{review.login}</text>
+            <text fg={theme.dimmed}>
+              {reviewStateLabel(review.state)} {relativeTime(review.submittedAt)}
+            </text>
+          </box>
+        )}
+      </For>
+    </box>
+  )
+}
+
+function PRRowRight(props: { row: PRRow; ctx: RowContext }) {
+  const item = props.row.item
+  switch (item.source) {
+    case "ghost":
+      return (
+        <box flexDirection="row" gap={1}>
+          <Show when={props.row.section === "needs_review" && isOpen(item.member.status)}>
+            <text fg={theme.faint}>doesn't request you ·</text>
+          </Show>
+          <StatusPill status={item.member.status} />
+          <Show when={props.row.section !== "mine" || item.member.author !== SELF_LOGIN}>
+            <text fg={theme.faint}>{item.member.author}</text>
+          </Show>
+        </box>
+      )
+    case "mine": {
+      const pr = item.pr
+      return (
+        <box flexDirection="row" gap={1}>
+          <Show when={props.ctx.view() === "stack"}>
+            <StatusPill status={pr.status} />
+          </Show>
+          <Show when={pr.status !== "merged"}>
+            <CIBadge ci={pr.ciStatus} />
+          </Show>
+          <text fg={theme.dimmed}>
+            {pr.mergedAt ? `merged ${relativeTime(pr.mergedAt)}` : relativeTime(pr.updatedAt)}
+          </text>
+        </box>
+      )
+    }
+    case "reviewer": {
+      const pr = item.pr
+      return (
+        <box flexDirection="row" gap={1}>
+          <Show when={pr.isDraft}>
+            <text fg={theme.draft}>draft</text>
+          </Show>
+          <Show when={pr.myReviewState}>
+            <text fg={theme.dimmed}>{reviewStateLabel(pr.myReviewState ?? "")}</text>
+          </Show>
+          <CIBadge ci={pr.ciStatus} />
+          <text fg={theme.info}>{pr.author}</text>
+          <text fg={theme.dimmed}>{relativeTime(pr.updatedAt)}</text>
+        </box>
+      )
+    }
+  }
+}
+
+function SectionHeader(props: { label: string; color: string; count: number; padding?: number }) {
+  return (
+    <box flexDirection="row" paddingX={props.padding ?? 1} gap={1}>
+      <text fg={props.color} attributes={TextAttributes.BOLD}>
+        {props.label}
+      </text>
+      <text fg={theme.dimmed}>({String(props.count)})</text>
+    </box>
+  )
+}
+
+function StackHeader(props: { stack: Stack; section: string; summary?: StackSummary; ctx: RowContext }) {
+  const slot = () => props.ctx.slot(props.stack)
+  const bottom = props.stack.members.at(0)
+  const details = [
+    ...(props.section === "mine" ? [] : [bottom?.author ?? "unknown"]),
+    `${props.stack.members.length} PRs → ${props.stack.baseRefName}`,
+  ].join(" · ")
+  const summary = props.summary ? summaryText[props.summary] : undefined
+  return (
+    <box flexDirection="row" paddingX={3} gap={1}>
+      <text fg={slot().color} attributes={TextAttributes.BOLD}>
+        {`▌${slot().letter}`}
+      </text>
+      <text fg={theme.text} attributes={TextAttributes.BOLD}>
+        {bottom?.title ?? `Stack ${props.stack.number}`}
+      </text>
+      <text fg={theme.dimmed}>{`· ${details}`}</text>
+      <box flexGrow={1} />
+      <Show when={summary}>
+        {(s) => <text fg={s().color}>{s().text}</text>}
       </Show>
     </box>
   )
 }
 
-function StatusGroup(props: {
-  status: PRStatus
-  prs: PR[]
-  selectedIndex: number
-  globalOffset: number
-}) {
+function RowView(props: { row: Row; ctx: RowContext }) {
+  const row = props.row
+  switch (row.kind) {
+    case "pr":
+      return <PRRowView row={row} ctx={props.ctx} />
+    case "section":
+      return row.section === "needs_review" ? (
+        <SectionHeader label="Needs My Review" color={theme.reviewNeeded} count={row.count} />
+      ) : (
+        <SectionHeader label="Reviewed by Me" color={theme.reviewedByMe} count={row.count} />
+      )
+    case "group":
+      return <SectionHeader label={statusLabels[row.status]} color={statusColors[row.status]} count={row.count} />
+    case "divider":
+      return (
+        <box flexDirection="row" paddingX={1}>
+          <text fg={theme.dimmed}>{"─── My PRs ───"}</text>
+        </box>
+      )
+    case "stack":
+      return <StackHeader stack={row.stack} section={row.section} summary={row.summary} ctx={props.ctx} />
+    case "unstacked":
+      return (
+        <box flexDirection="row" paddingX={3} gap={1}>
+          <text fg={theme.dimmed}>Not in a stack</text>
+          <text fg={theme.dimmed}>({String(row.count)})</text>
+        </box>
+      )
+    case "blank":
+      return <box height={1} />
+  }
+}
+
+function StatusLine(props: { view: View; row: PRRow | undefined; data: DashboardData; ctx: RowContext }) {
+  const chain = () => (props.row ? stackChain(props.row, props.data) : [])
+  const stack = () => props.row?.stack?.stack
   return (
-    <box flexDirection="column">
-      <box flexDirection="row" paddingX={1} gap={1}>
-        <text fg={statusColors[props.status]} attributes={TextAttributes.BOLD}>
-          {statusLabels[props.status]}
-        </text>
-        <text fg={theme.dimmed}>({String(props.prs.length)})</text>
-      </box>
-      <For each={props.prs}>
-        {(pr, i) => (
-          <PRRow
-            pr={pr}
-            selected={props.globalOffset + i() === props.selectedIndex}
-          />
+    <box flexDirection="row" paddingX={1} height={1} overflow="hidden">
+      <Show when={props.view === "status" && stack()}>
+        {(s) => (
+          <box flexDirection="row" gap={1}>
+            <text fg={props.ctx.slot(s()).color} attributes={TextAttributes.BOLD}>
+              {`▌${props.ctx.slot(s()).letter}`}
+            </text>
+            <text fg={theme.text} attributes={TextAttributes.BOLD} wrapMode="none">
+              {truncate(s().members.at(0)?.title ?? "", 40)}
+            </text>
+            <For each={chain()}>
+              {(link, i) => (
+                <box flexDirection="row" gap={1}>
+                  <Show when={i() > 0}>
+                    <text fg={theme.dimmed}>→</text>
+                  </Show>
+                  <text fg={link.here ? theme.text : theme.dimmed} attributes={link.here ? TextAttributes.BOLD : 0}>
+                    {link.here ? `${link.position} (here)` : String(link.position)}
+                  </text>
+                  <text fg={memberColor(link.status)}>{memberLabels[link.status]}</text>
+                  <Show when={link.status !== "merged" && link.status !== "closed"}>
+                    <CIBadge ci={link.ci} />
+                  </Show>
+                  <Show when={link.notRequested}>
+                    <text fg={theme.dimmed}>(doesn't request you)</text>
+                  </Show>
+                </box>
+              )}
+            </For>
+          </box>
         )}
-      </For>
-      <box height={1} />
+      </Show>
+      <box flexGrow={1} />
+      <Show when={props.view === "stack" || stack()}>
+        <text fg={theme.dimmed}>{props.view === "stack" ? "tab: back to status view" : "tab: show stack"}</text>
+      </Show>
     </box>
   )
 }
 
-function ReviewerPRRow(props: { pr: ReviewerPR; selected: boolean }) {
-  const bgColor = props.selected ? theme.surface : theme.bg
-
-  return (
-    <box flexDirection="column" backgroundColor={bgColor}>
-      <box flexDirection="row" gap={1} paddingX={2}>
-        <Show when={props.selected}>
-          <text fg={theme.accent} attributes={TextAttributes.BOLD}>
-            {">"}
-          </text>
-        </Show>
-        <Show when={!props.selected}>
-          <text fg={theme.bg}>{" "}</text>
-        </Show>
-        <text fg={theme.dimmed}>#{String(props.pr.number)}</text>
-        <text
-          fg={props.selected ? theme.text : theme.text}
-          attributes={props.selected ? TextAttributes.BOLD : 0}
-        >
-          {props.pr.title}
-        </text>
-        <box flexGrow={1} />
-        <Show when={props.pr.isDraft}>
-          <text fg={theme.draft}>draft</text>
-        </Show>
-        <Show when={props.pr.myReviewState}>
-          <text fg={theme.dimmed}>{reviewStateLabel(props.pr.myReviewState ?? "")}</text>
-        </Show>
-        <CIBadge ci={props.pr.ciStatus} />
-        <text fg={theme.info}>{props.pr.author}</text>
-        <text fg={theme.dimmed}>{relativeTime(props.pr.updatedAt)}</text>
-      </box>
-    </box>
-  )
-}
-
-function ReviewerSection(props: {
-  label: string
-  color: string
-  prs: ReviewerPR[]
-  selectedIndex: number
-  globalOffset: number
-}) {
-  return (
-    <box flexDirection="column">
-      <box flexDirection="row" paddingX={1} gap={1}>
-        <text fg={props.color} attributes={TextAttributes.BOLD}>
-          {props.label}
-        </text>
-        <text fg={theme.dimmed}>({String(props.prs.length)})</text>
-      </box>
-      <For each={props.prs}>
-        {(pr, i) => (
-          <ReviewerPRRow
-            pr={pr}
-            selected={props.globalOffset + i() === props.selectedIndex}
-          />
-        )}
-      </For>
-      <box height={1} />
-    </box>
-  )
-}
-
-function Footer() {
-  const binds = [
+function Footer(props: { view: View }) {
+  const binds = () => [
     { key: " r ", desc: "Refresh" },
     { key: " o ", desc: "Open in browser" },
     { key: " j/k ", desc: "Navigate" },
+    { key: " tab ", desc: props.view === "status" ? "Stack view" : "Status view" },
     { key: " q ", desc: "Quit" },
   ]
 
   return (
     <box paddingX={1} height={1} backgroundColor={theme.surface}>
       <box flexDirection="row" gap={2}>
-        <For each={binds}>
+        <For each={binds()}>
           {(b) => (
             <box flexDirection="row">
               <text fg="#fff" bg={theme.accentDim}>
@@ -677,12 +782,12 @@ function Footer() {
   )
 }
 
-function ErrorBanner(props: { message: string }) {
+function ErrorBanner(props: { label: string; message: string }) {
   return (
     <box paddingX={2} paddingY={1}>
       <box flexDirection="row" gap={1}>
         <text fg={theme.error} attributes={TextAttributes.BOLD}>
-          Error:
+          {props.label}
         </text>
         <text fg={theme.error}>{props.message}</text>
       </box>
@@ -703,10 +808,15 @@ function App() {
   const [prs, setPrs] = createSignal<PR[]>([])
   const [needsMyReview, setNeedsMyReview] = createSignal<ReviewerPR[]>([])
   const [reviewedByMe, setReviewedByMe] = createSignal<ReviewerPR[]>([])
+  const [stacks, setStacks] = createSignal<StackIndex>(new Map())
+  const [stackSlots, setStackSlots] = createSignal<Map<number, number>>(new Map())
   const [loading, setLoading] = createSignal(true)
   const [error, setError] = createSignal("")
+  const [stackError, setStackError] = createSignal("")
   const [lastRefresh, setLastRefresh] = createSignal("")
-  const [selectedIndex, setSelectedIndex] = createSignal(0)
+  const [view, setView] = createSignal<View>("status")
+  const [selection, setSelection] = createSignal<Selection | undefined>()
+  const [lastIndex, setLastIndex] = createSignal(0)
 
   async function refresh() {
     setLoading(true)
@@ -730,12 +840,24 @@ function App() {
         (pr) => !needsReviewNumbers.has(pr.number) && !myPRNumbers.has(pr.number),
       )
 
+      // Stacks are an overlay: without them the dashboard still shows every PR, so a failure here
+      // is reported next to the PRs instead of replacing them.
+      const numbers = [...reviewRequested, ...dedupedReviewedByMe, ...authoredPRs].map((pr) => pr.number)
+      let stackIndex: StackIndex = new Map()
+      let stackFailure = ""
+      try {
+        stackIndex = await fetchStacks(numbers)
+      } catch (e) {
+        stackFailure = e instanceof Error ? e.message : String(e)
+      }
+
       batch(() => {
         setPrs(authoredPRs)
         setNeedsMyReview(reviewRequested)
         setReviewedByMe(dedupedReviewedByMe)
-        const count = authoredPRs.length + reviewRequested.length + dedupedReviewedByMe.length
-        setSelectedIndex((i) => Math.min(i, Math.max(0, count - 1)))
+        setStacks(stackIndex)
+        setStackSlots((prev) => assignStackSlots(prev, [...stackIndex.values()].map((s) => s.number)))
+        setStackError(stackFailure)
         setLastRefresh(new Date().toLocaleTimeString())
         setLoading(false)
       })
@@ -747,20 +869,23 @@ function App() {
     }
   }
 
-  // Grouped and ordered PRs (my authored PRs)
-  const grouped = createMemo(() => {
-    const reviewerOffset = needsMyReview().length + reviewedByMe().length
-    const groups: Array<{ status: PRStatus; prs: PR[]; offset: number }> = []
-    let offset = reviewerOffset
-    for (const status of statusOrder) {
-      const matching = prs().filter((pr) => pr.status === status)
-      if (matching.length > 0) {
-        groups.push({ status, prs: matching, offset })
-        offset += matching.length
-      }
-    }
-    return groups
-  })
+  const data = createMemo<DashboardData>(() => ({
+    needsReview: needsMyReview(),
+    reviewedByMe: reviewedByMe(),
+    mine: prs(),
+  }))
+  const rows = createMemo(() => buildRows(view(), data(), stacks()))
+  const selectable = createMemo(() => prRows(rows()))
+  const selected = createMemo(() => effectiveSelection(rows(), selection(), lastIndex(), stacks()))
+
+  const ctx: RowContext = {
+    view,
+    selected,
+    slot: (stack) => {
+      const slot = stackSlots().get(stack.number) ?? 0
+      return { letter: slotLetter(slot), color: theme.stacks[slot % theme.stacks.length] ?? theme.dimmed }
+    },
+  }
 
   const totalPRs = createMemo(() => prs().filter((pr) => pr.status !== "merged").length)
   const totalMerged = createMemo(() => prs().filter((pr) => pr.status === "merged").length)
@@ -768,19 +893,19 @@ function App() {
     () => needsMyReview().length + reviewedByMe().length + prs().length,
   )
 
-  // Offset where "reviewed by me" section starts in the flat list
-  const reviewedByMeOffset = createMemo(() => needsMyReview().length)
-
-  // Flat list of PR numbers for navigation + open-in-browser
-  const flatItems = createMemo(() => {
-    const result: Array<{ number: number }> = []
-    for (const pr of needsMyReview()) result.push({ number: pr.number })
-    for (const pr of reviewedByMe()) result.push({ number: pr.number })
-    for (const g of grouped()) {
-      for (const pr of g.prs) result.push({ number: pr.number })
-    }
-    return result
-  })
+  function moveSelection(delta: number) {
+    const list = selectable()
+    if (list.length === 0) return
+    const current = selected()
+    const index = current ? list.findIndex((r) => r.key === current.key) : 0
+    const nextIndex = Math.min(Math.max(index + delta, 0), list.length - 1)
+    const next = list[nextIndex]
+    if (!next) return
+    batch(() => {
+      setSelection({ section: next.section, number: next.number })
+      setLastIndex(nextIndex)
+    })
+  }
 
   // Keyboard
   const renderer = useRenderer()
@@ -798,26 +923,20 @@ function App() {
   useKeyboard((key) => {
     if (key.name === "q") return quit()
     if (key.name === "r") refresh()
+    if (key.name === "tab") setView((v) => (v === "status" ? "stack" : "status"))
 
     if (key.name === "o") {
-      const item = flatItems()[selectedIndex()]
-      if (item) {
-        Bun.spawn(["gh", "pr", "view", "--repo", REPO, "--web", String(item.number)], {
+      const row = selected()
+      if (row) {
+        Bun.spawn(["gh", "pr", "view", "--repo", REPO, "--web", String(row.number)], {
           stdout: "ignore",
           stderr: "ignore",
         })
       }
     }
 
-    const total = flatItems().length
-    if (total === 0) return
-
-    if (key.name === "j" || key.name === "arrow-down") {
-      setSelectedIndex((i) => Math.min(i + 1, total - 1))
-    }
-    if (key.name === "k" || key.name === "arrow-up") {
-      setSelectedIndex((i) => Math.max(i - 1, 0))
-    }
+    if (key.name === "j" || key.name === "arrow-down") moveSelection(1)
+    if (key.name === "k" || key.name === "arrow-up") moveSelection(-1)
   })
 
   // Initial fetch + auto-refresh
@@ -839,10 +958,15 @@ function App() {
         reviewedByMeCount={reviewedByMe().length}
         lastRefresh={lastRefresh()}
         loading={loading()}
+        view={view()}
       />
 
       <Show when={error()}>
-        <ErrorBanner message={error()} />
+        <ErrorBanner label="Error:" message={error()} />
+      </Show>
+
+      <Show when={stackError()}>
+        <ErrorBanner label="Stacks unavailable:" message={stackError()} />
       </Show>
 
       <Show when={!loading() && totalItems() === 0 && !error()}>
@@ -850,45 +974,13 @@ function App() {
       </Show>
 
       <box flexDirection="column" flexGrow={1} paddingY={1}>
-        <Show when={needsMyReview().length > 0}>
-          <ReviewerSection
-            label="Needs My Review"
-            color={theme.reviewNeeded}
-            prs={needsMyReview()}
-            selectedIndex={selectedIndex()}
-            globalOffset={0}
-          />
-        </Show>
-
-        <Show when={reviewedByMe().length > 0}>
-          <ReviewerSection
-            label="Reviewed by Me"
-            color={theme.reviewedByMe}
-            prs={reviewedByMe()}
-            selectedIndex={selectedIndex()}
-            globalOffset={reviewedByMeOffset()}
-          />
-        </Show>
-
-        <Show when={prs().length > 0}>
-          <box flexDirection="row" paddingX={1}>
-            <text fg={theme.dimmed}>{"─── My PRs ───"}</text>
-          </box>
-        </Show>
-
-        <For each={grouped()}>
-          {(group) => (
-            <StatusGroup
-              status={group.status}
-              prs={group.prs}
-              selectedIndex={selectedIndex()}
-              globalOffset={group.offset}
-            />
-          )}
+        <For each={rows()}>
+          {(row) => <RowView row={row} ctx={ctx} />}
         </For>
       </box>
 
-      <Footer />
+      <StatusLine view={view()} row={selected()} data={data()} ctx={ctx} />
+      <Footer view={view()} />
     </box>
   )
 }
