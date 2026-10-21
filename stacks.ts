@@ -1,9 +1,10 @@
-import { statusOrder, type CIStatus, type PR, type PRStatus, type ReviewerPR } from "./model"
+import { prKey, statusOrder, type CIStatus, type PR, type PRRef, type PRStatus, type ReviewerPR } from "./model"
 
 // ─── Stack data ───────────────────────────────────────────────────
 export type MemberStatus = PRStatus | "closed"
 
 export interface StackMember {
+  repo: string
   number: number
   title: string
   url: string
@@ -13,14 +14,22 @@ export interface StackMember {
 }
 
 export interface Stack {
+  repo: string
   number: number
   baseRefName: string
   /** Bottom (position 1, closest to the base branch) to top. */
   members: StackMember[]
 }
 
-/** PR number → the stack it belongs to. */
-export type StackIndex = Map<number, Stack>
+/** Stack numbers, like PR numbers, are only unique within one repository. */
+export type StackId = Pick<Stack, "repo" | "number">
+
+export function stackKey(stack: StackId): string {
+  return `${stack.repo}#${stack.number}`
+}
+
+/** `prKey` of a PR → the stack it belongs to. */
+export type StackIndex = Map<string, Stack>
 
 interface GHStackEntryPR {
   number: number
@@ -83,7 +92,7 @@ function memberStatus(pr: GHStackEntryPR): MemberStatus {
   return "waiting_for_review"
 }
 
-export function parseStacks(responses: GHStackResponse[]): StackIndex {
+export function parseStacks(repo: string, responses: GHStackResponse[]): StackIndex {
   const index: StackIndex = new Map()
   for (const response of responses) {
     for (const pr of Object.values(response.data.repository ?? {})) {
@@ -93,6 +102,7 @@ export function parseStacks(responses: GHStackResponse[]): StackIndex {
         const p = entry?.pullRequest
         if (!entry || !p) continue
         members.push({
+          repo,
           number: p.number,
           title: p.title,
           url: p.url,
@@ -102,10 +112,10 @@ export function parseStacks(responses: GHStackResponse[]): StackIndex {
         })
       }
       members.sort((a, b) => a.position - b.position)
-      const stack: Stack = { number: pr.stack.number, baseRefName: pr.stack.baseRefName, members }
-      index.set(pr.number, stack)
+      const stack: Stack = { repo, number: pr.stack.number, baseRefName: pr.stack.baseRefName, members }
+      index.set(prKey({ repo, number: pr.number }), stack)
       // Members outside the fetched lists (ghost rows) need their stack too.
-      for (const m of members) if (!index.has(m.number)) index.set(m.number, stack)
+      for (const m of members) if (!index.has(prKey(m))) index.set(prKey(m), stack)
     }
   }
   return index
@@ -113,15 +123,20 @@ export function parseStacks(responses: GHStackResponse[]): StackIndex {
 
 // ─── Stack letters ────────────────────────────────────────────────
 /**
- * Gives every stack a slot (letter + color). Stacks that are still present keep their slot across
- * refreshes; new stacks take the lowest free slot, in stack-number order.
+ * Gives every stack a slot (letter + color), keyed by `stackKey`. Stacks that are still present keep
+ * their slot across refreshes; new stacks take the lowest free slot, in repository then stack-number
+ * order.
  */
 export function assignStackSlots(
-  previous: ReadonlyMap<number, number>,
-  stackNumbers: Iterable<number>,
-): Map<number, number> {
-  const current = [...new Set(stackNumbers)].sort((a, b) => a - b)
-  const slots = new Map<number, number>()
+  previous: ReadonlyMap<string, number>,
+  stacks: Iterable<StackId>,
+): Map<string, number> {
+  const unique = new Map<string, StackId>()
+  for (const s of stacks) unique.set(stackKey(s), s)
+  const current = [...unique.values()]
+    .sort((a, b) => (a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : a.number - b.number))
+    .map(stackKey)
+  const slots = new Map<string, number>()
   const used = new Set<number>()
   for (const n of current) {
     const slot = previous.get(n)
@@ -175,6 +190,7 @@ export interface PRRow {
   kind: "pr"
   key: string
   section: SectionId
+  repo: string
   number: number
   item: RowItem
   stack?: StackRef
@@ -193,23 +209,32 @@ export type Row =
   | { kind: "blank" }
   | PRRow
 
-export function rowKey(section: SectionId, number: number): string {
-  return `${section}:${number}`
+export function rowKey(section: SectionId, ref: PRRef): string {
+  return `${section}:${prKey(ref)}`
 }
 
-function stackRef(stacks: StackIndex, number: number): StackRef | undefined {
-  const stack = stacks.get(number)
-  const member = stack?.members.find((m) => m.number === number)
+function stackRef(stacks: StackIndex, ref: PRRef): StackRef | undefined {
+  const stack = stacks.get(prKey(ref))
+  const member = stack?.members.find((m) => m.number === ref.number)
   return stack && member ? { stack, position: member.position } : undefined
 }
 
-function itemNumber(item: RowItem): number {
-  return item.source === "ghost" ? item.member.number : item.pr.number
+function itemRef(item: RowItem): PRRef {
+  return item.source === "ghost" ? item.member : item.pr
 }
 
 function prRow(section: SectionId, item: RowItem, stacks: StackIndex, startHere = false): PRRow {
-  const number = itemNumber(item)
-  return { kind: "pr", key: rowKey(section, number), section, number, item, stack: stackRef(stacks, number), startHere }
+  const { repo, number } = itemRef(item)
+  return {
+    kind: "pr",
+    key: rowKey(section, { repo, number }),
+    section,
+    repo,
+    number,
+    item,
+    stack: stackRef(stacks, { repo, number }),
+    startHere,
+  }
 }
 
 function sectionItems(data: DashboardData, section: SectionId): RowItem[] {
@@ -241,9 +266,9 @@ function sortStable<T>(items: T[], rank: (item: T) => number): T[] {
     .map((x) => x.item)
 }
 
-function summarize(stack: Stack, mine: ReadonlyMap<number, PR>): StackSummary | undefined {
+function summarize(stack: Stack, mine: ReadonlyMap<string, PR>): StackSummary | undefined {
   const layers = stack.members.map((m) => {
-    const pr = mine.get(m.number)
+    const pr = mine.get(prKey(m))
     return { status: pr?.status ?? m.status, ci: pr?.ciStatus ?? "unknown" }
   })
   const open = layers.filter((l) => isOpen(l.status))
@@ -281,17 +306,17 @@ function stackSectionRows(data: DashboardData, section: SectionId, stacks: Stack
   if (items.length === 0) return []
   const rows: Row[] = section === "mine" ? [{ kind: "divider" }] : [{ kind: "section", section, count: items.length }]
 
-  const byStack = new Map<number, { stack: Stack; items: RowItem[] }>()
+  const byStack = new Map<string, { stack: Stack; items: RowItem[] }>()
   const unstacked: RowItem[] = []
   for (const item of items) {
-    const stack = stacks.get(itemNumber(item))
+    const stack = stacks.get(prKey(itemRef(item)))
     if (!stack) {
       unstacked.push(item)
       continue
     }
-    const entry = byStack.get(stack.number) ?? { stack, items: [] }
+    const entry = byStack.get(stackKey(stack)) ?? { stack, items: [] }
     entry.items.push(item)
-    byStack.set(stack.number, entry)
+    byStack.set(stackKey(stack), entry)
   }
 
   let groups = [...byStack.values()]
@@ -302,13 +327,13 @@ function stackSectionRows(data: DashboardData, section: SectionId, stacks: Stack
     rest = sortStable(unstacked, (i) => statusRank(itemStatus(i) ?? "closed"))
   }
 
-  const mine = new Map(data.mine.map((pr) => [pr.number, pr]))
+  const mine = new Map(data.mine.map((pr) => [prKey(pr), pr]))
   for (const { stack, items: real } of groups) {
     rows.push({ kind: "stack", section, stack, summary: section === "mine" ? summarize(stack, mine) : undefined })
-    const realByNumber = new Map(real.map((i) => [itemNumber(i), i]))
-    const lowestReal = stack.members.find((m) => realByNumber.has(m.number))?.number
+    const realByKey = new Map(real.map((i) => [prKey(itemRef(i)), i]))
+    const lowestReal = stack.members.find((m) => realByKey.has(prKey(m)))?.number
     for (const member of stack.members) {
-      const item = realByNumber.get(member.number)
+      const item = realByKey.get(prKey(member))
       if (item) {
         const startHere = section === "needs_review" && real.length > 1 && member.number === lowestReal
         rows.push(prRow(section, item, stacks, startHere))
@@ -337,9 +362,8 @@ export function prRows(rows: Row[]): PRRow[] {
 }
 
 // ─── Selection ────────────────────────────────────────────────────
-export interface Selection {
+export interface Selection extends PRRef {
   section: SectionId
-  number: number
 }
 
 /**
@@ -356,15 +380,15 @@ export function effectiveSelection(
   const selectable = prRows(rows)
   if (selectable.length === 0) return undefined
   if (selection) {
-    const key = rowKey(selection.section, selection.number)
+    const key = rowKey(selection.section, selection)
     const exact = selectable.find((r) => r.key === key)
     if (exact) return exact
 
-    const ref = stackRef(stacks, selection.number)
+    const ref = stackRef(stacks, selection)
     if (ref) {
       let nearest: { row: PRRow; distance: number } | undefined
       for (const r of selectable) {
-        if (r.section !== selection.section || r.stack?.stack.number !== ref.stack.number) continue
+        if (r.section !== selection.section || !r.stack || stackKey(r.stack.stack) !== stackKey(ref.stack)) continue
         const distance = Math.abs(r.stack.position - ref.position)
         if (!nearest || distance < nearest.distance) nearest = { row: r, distance }
       }
@@ -387,19 +411,19 @@ export interface ChainLink {
 
 export function stackChain(row: PRRow, data: DashboardData): ChainLink[] {
   if (!row.stack) return []
-  const mine = new Map(data.mine.map((pr) => [pr.number, pr]))
-  const ci = new Map<number, CIStatus>()
-  for (const pr of [...data.needsReview, ...data.reviewedByMe, ...data.mine]) ci.set(pr.number, pr.ciStatus)
-  const requested = new Set(data.needsReview.map((pr) => pr.number))
+  const mine = new Map(data.mine.map((pr) => [prKey(pr), pr]))
+  const ci = new Map<string, CIStatus>()
+  for (const pr of [...data.needsReview, ...data.reviewedByMe, ...data.mine]) ci.set(prKey(pr), pr.ciStatus)
+  const requested = new Set(data.needsReview.map(prKey))
   return row.stack.stack.members.map((m) => {
-    const status = mine.get(m.number)?.status ?? m.status
+    const status = mine.get(prKey(m))?.status ?? m.status
     return {
       position: m.position,
       number: m.number,
       status,
-      ci: ci.get(m.number) ?? "unknown",
-      here: m.number === row.number,
-      notRequested: row.section === "needs_review" && isOpen(status) && !requested.has(m.number),
+      ci: ci.get(prKey(m)) ?? "unknown",
+      here: prKey(m) === prKey(row),
+      notRequested: row.section === "needs_review" && isOpen(status) && !requested.has(prKey(m)),
     }
   })
 }

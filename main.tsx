@@ -2,7 +2,9 @@ import { createCliRenderer, TextAttributes } from "@opentui/core"
 import { render, useKeyboard, useRenderer } from "@opentui/solid"
 import { createSignal, createMemo, For, Show, onCleanup, batch } from "solid-js"
 import type { CIStatus, PR, PRStatus, ReviewInfo, ReviewerPR } from "./model"
+import { prKey } from "./model"
 import { mergedSearch, recentMerges } from "./recent-merges"
+import { parseRepos, type RepoConfig } from "./repos"
 import {
   assignStackSlots,
   buildRows,
@@ -12,6 +14,7 @@ import {
   prRows,
   slotLetter,
   stackChain,
+  stackKey,
   stackQuery,
   type DashboardData,
   type GHStackResponse,
@@ -90,37 +93,49 @@ const REFRESH_INTERVAL_MS = 5 * 60 * 1000
 const STACK_QUERY_CHUNK = 40
 
 interface Config {
-  repo: string
+  repos: RepoConfig[]
   selfLogin: string
 }
 
-function readArgValue(name: string): string | undefined {
+function readArgValues(name: string): string[] {
   const prefix = `${name}=`
+  const values: string[] = []
   for (let i = 2; i < Bun.argv.length; i++) {
     const arg = Bun.argv.at(i)
     if (!arg) continue
-    if (arg === name) return Bun.argv.at(i + 1)
-    if (arg.startsWith(prefix)) return arg.slice(prefix.length)
+    if (arg === name) {
+      const value = Bun.argv.at(i + 1)
+      if (value !== undefined) values.push(value)
+      i++
+    } else if (arg.startsWith(prefix)) {
+      values.push(arg.slice(prefix.length))
+    }
   }
-  return undefined
+  return values
 }
 
 function readConfig(): Config {
-  const repo = readArgValue("--repo") ?? Bun.env.PR_DASHBOARD_REPO
-  const selfLogin = readArgValue("--self-login") ?? Bun.env.PR_DASHBOARD_SELF_LOGIN
+  const repoArgs = readArgValues("--repo")
+  const repoEnv = Bun.env.PR_DASHBOARD_REPO
+  const repos = parseRepos(repoArgs.length > 0 ? repoArgs : repoEnv ? [repoEnv] : [])
+  const selfLogin = readArgValues("--self-login").at(0) ?? Bun.env.PR_DASHBOARD_SELF_LOGIN
 
-  if (!repo || !selfLogin) {
+  if (repos.length === 0 || !selfLogin) {
     throw new Error(
       "Missing config. Set PR_DASHBOARD_REPO and PR_DASHBOARD_SELF_LOGIN, or pass --repo owner/name --self-login username.",
     )
   }
 
-  return { repo, selfLogin }
+  return { repos, selfLogin }
 }
 
 const config = readConfig()
-const REPO = config.repo
+const REPOS = config.repos
 const SELF_LOGIN = config.selfLogin
+const REPO_LABELS = new Map(REPOS.map((r) => [r.name, r.label]))
+/** Width of the per-row repository tag; 0 hides it when only one repository is tracked. */
+const REPO_TAG_WIDTH = REPOS.length > 1 ? Math.max(...REPOS.map((r) => r.label.length)) : 0
+const REPOS_TITLE = REPOS.length > 1 ? REPOS.map((r) => r.label).join(" · ") : (REPOS.at(0)?.name ?? "")
 
 async function runGh(args: string[]): Promise<string> {
   const proc = Bun.spawn(["gh", ...args], { stdout: "pipe", stderr: "pipe" })
@@ -196,8 +211,9 @@ function getHumanReviews(pr: GHPullRequest): ReviewInfo[] {
   return result
 }
 
-function parsePRs(raw: GHPullRequest[]): PR[] {
+function parsePRs(repo: string, raw: GHPullRequest[]): PR[] {
   return raw.map((pr) => ({
+    repo,
     number: pr.number,
     title: pr.title,
     url: pr.url,
@@ -211,7 +227,7 @@ function parsePRs(raw: GHPullRequest[]): PR[] {
   }))
 }
 
-async function fetchPRData(state: "open" | "merged" = "open"): Promise<PR[]> {
+async function fetchPRData(repo: string, state: "open" | "merged" = "open"): Promise<PR[]> {
   const now = Date.now()
   const fields = [
     "number",
@@ -232,7 +248,7 @@ async function fetchPRData(state: "open" | "merged" = "open"): Promise<PR[]> {
     "pr",
     "list",
     "--repo",
-    REPO,
+    repo,
     "--author",
     "@me",
     "--state",
@@ -245,7 +261,7 @@ async function fetchPRData(state: "open" | "merged" = "open"): Promise<PR[]> {
   ])
 
   const raw: GHPullRequest[] = JSON.parse(stdout)
-  return parsePRs(state === "merged" ? recentMerges(raw, now) : raw)
+  return parsePRs(repo, state === "merged" ? recentMerges(raw, now) : raw)
 }
 
 const REVIEWER_FIELDS = [
@@ -262,6 +278,7 @@ const REVIEWER_FIELDS = [
 ].join(",")
 
 function parseReviewerPRs(
+  repo: string,
   raw: GHPullRequest[],
   opts: { includeMyReviewState: boolean },
 ): ReviewerPR[] {
@@ -277,6 +294,7 @@ function parseReviewerPRs(
       }
     }
     return {
+      repo,
       number: pr.number,
       title: pr.title,
       url: pr.url,
@@ -291,10 +309,10 @@ function parseReviewerPRs(
   })
 }
 
-async function fetchReviewerPRs(search: string, includeMyReviewState: boolean): Promise<ReviewerPR[]> {
+async function fetchReviewerPRs(repo: string, search: string, includeMyReviewState: boolean): Promise<ReviewerPR[]> {
   const stdout = await runGh([
     "pr", "list",
-    "--repo", REPO,
+    "--repo", repo,
     "--search", search,
     "--state", "open",
     "--json", REVIEWER_FIELDS,
@@ -302,26 +320,47 @@ async function fetchReviewerPRs(search: string, includeMyReviewState: boolean): 
   ])
 
   const raw: GHPullRequest[] = JSON.parse(stdout)
-  return parseReviewerPRs(raw, { includeMyReviewState })
+  return parseReviewerPRs(repo, raw, { includeMyReviewState })
 }
 
-const fetchReviewRequestedPRs = () => fetchReviewerPRs("review-requested:@me", false)
-const fetchReviewedByMePRs = () => fetchReviewerPRs("reviewed-by:@me", true)
+const fetchReviewRequestedPRs = (repo: string) => fetchReviewerPRs(repo, "review-requested:@me", false)
+const fetchReviewedByMePRs = (repo: string) => fetchReviewerPRs(repo, "reviewed-by:@me", true)
 
 // `gh pr list --json` has no stack fields, so stack membership comes from GraphQL.
-async function fetchStacks(numbers: number[]): Promise<StackIndex> {
+async function fetchStacks(repo: string, numbers: number[]): Promise<StackIndex> {
   const chunks: number[][] = []
   for (let i = 0; i < numbers.length; i += STACK_QUERY_CHUNK) {
     chunks.push(numbers.slice(i, i + STACK_QUERY_CHUNK))
   }
   const responses = await Promise.all(
     chunks.map(async (chunk) => {
-      const stdout = await runGh(["api", "graphql", "-f", `query=${stackQuery(REPO, chunk)}`])
+      const stdout = await runGh(["api", "graphql", "-f", `query=${stackQuery(repo, chunk)}`])
       const response: GHStackResponse = JSON.parse(stdout)
       return response
     }),
   )
-  return parseStacks(responses)
+  return parseStacks(repo, responses)
+}
+
+interface RepoData {
+  open: PR[]
+  merged: PR[]
+  reviewRequested: ReviewerPR[]
+  reviewedBy: ReviewerPR[]
+}
+
+async function fetchRepoData(repo: string): Promise<RepoData> {
+  const [open, reviewRequested, reviewedBy, merged] = await Promise.all([
+    fetchPRData(repo),
+    fetchReviewRequestedPRs(repo),
+    fetchReviewedByMePRs(repo),
+    fetchPRData(repo, "merged"),
+  ])
+  return { open, merged, reviewRequested, reviewedBy }
+}
+
+function newestFirst<T>(time: (item: T) => string | null | undefined): (a: T, b: T) => number {
+  return (a, b) => Date.parse(time(b) ?? "") - Date.parse(time(a) ?? "")
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -448,7 +487,7 @@ function Header(props: {
         <text fg={theme.accent} attributes={TextAttributes.BOLD}>
           PR Dashboard
         </text>
-        <text fg={theme.dimmed}>{REPO}</text>
+        <text fg={theme.dimmed}>{REPOS_TITLE}</text>
         <text fg="#fff" bg={theme.accent}>
           {` ${props.view} view `}
         </text>
@@ -507,6 +546,8 @@ interface RowContext {
   view: () => View
   selected: () => PRRow | undefined
   slot: (stack: Stack) => StackSlot
+  /** Width of `#<number>` for the widest visible PR, so titles line up across repositories. */
+  numberWidth: () => number
 }
 
 function StatusPill(props: { status: MemberStatus }) {
@@ -524,7 +565,8 @@ function PRRowView(props: { row: PRRow; ctx: RowContext }) {
       !isSelected() &&
       row.stack !== undefined &&
       sel?.section === row.section &&
-      sel.stack?.stack.number === row.stack.stack.number
+      sel.stack !== undefined &&
+      stackKey(sel.stack.stack) === stackKey(row.stack.stack)
     )
   }
   const slot = () => (row.stack ? props.ctx.slot(row.stack.stack) : undefined)
@@ -553,11 +595,14 @@ function PRRowView(props: { row: PRRow; ctx: RowContext }) {
           <text fg={ghost ? theme.faint : (slot()?.color ?? theme.bg)}>
             {row.stack ? String(row.stack.position).padStart(2) : "  "}
           </text>
-          <Show when={merged}>
-            <text fg={theme.accent}>✓</text>
-          </Show>
+          <text fg={theme.accent}>{merged ? "✓" : " "}</text>
         </Show>
-        <text fg={ghost ? theme.faint : theme.dimmed}>#{String(row.number)}</text>
+        <Show when={REPO_TAG_WIDTH > 0}>
+          <text fg={ghost ? theme.faint : theme.dimmed}>
+            {(REPO_LABELS.get(row.repo) ?? row.repo).padEnd(REPO_TAG_WIDTH)}
+          </text>
+        </Show>
+        <text fg={ghost ? theme.faint : theme.dimmed}>{`#${row.number}`.padEnd(props.ctx.numberWidth())}</text>
         <Show when={props.ctx.view() === "status" && row.stack}>
           {(stack) => (
             <text fg={slot()?.color ?? theme.dimmed}>
@@ -809,7 +854,7 @@ function App() {
   const [needsMyReview, setNeedsMyReview] = createSignal<ReviewerPR[]>([])
   const [reviewedByMe, setReviewedByMe] = createSignal<ReviewerPR[]>([])
   const [stacks, setStacks] = createSignal<StackIndex>(new Map())
-  const [stackSlots, setStackSlots] = createSignal<Map<number, number>>(new Map())
+  const [stackSlots, setStackSlots] = createSignal<Map<string, number>>(new Map())
   const [loading, setLoading] = createSignal(true)
   const [error, setError] = createSignal("")
   const [stackError, setStackError] = createSignal("")
@@ -822,42 +867,51 @@ function App() {
     setLoading(true)
     setError("")
     try {
-      const [myPRs, reviewRequested, reviewedBy, mergedPRs] = await Promise.all([
-        fetchPRData(),
-        fetchReviewRequestedPRs(),
-        fetchReviewedByMePRs(),
-        fetchPRData("merged"),
-      ])
+      const perRepo = await Promise.all(REPOS.map((r) => fetchRepoData(r.name)))
+      const myPRs = perRepo.flatMap((d) => d.open)
+      const mergedPRs = perRepo.flatMap((d) => d.merged).sort(newestFirst((pr: PR) => pr.mergedAt))
+      const reviewRequested = perRepo.flatMap((d) => d.reviewRequested).sort(newestFirst((pr: ReviewerPR) => pr.createdAt))
+      const reviewedBy = perRepo.flatMap((d) => d.reviewedBy).sort(newestFirst((pr: ReviewerPR) => pr.createdAt))
+
       // A PR can merge between the concurrent queries; prefer its merged snapshot.
-      const mergedNumbers = new Set(mergedPRs.map((pr) => pr.number))
-      const authoredPRs = [...myPRs.filter((pr) => !mergedNumbers.has(pr.number)), ...mergedPRs]
+      const mergedKeys = new Set(mergedPRs.map(prKey))
+      const authoredPRs = [
+        ...myPRs.filter((pr) => !mergedKeys.has(prKey(pr))).sort(newestFirst((pr: PR) => pr.createdAt)),
+        ...mergedPRs,
+      ]
 
       // Deduplicate: remove from "reviewed by me" anything that's in
       // "needs my review" (re-requested) or authored by me
-      const needsReviewNumbers = new Set(reviewRequested.map((pr) => pr.number))
-      const myPRNumbers = new Set(authoredPRs.map((pr) => pr.number))
+      const needsReviewKeys = new Set(reviewRequested.map(prKey))
+      const myPRKeys = new Set(authoredPRs.map(prKey))
       const dedupedReviewedByMe = reviewedBy.filter(
-        (pr) => !needsReviewNumbers.has(pr.number) && !myPRNumbers.has(pr.number),
+        (pr) => !needsReviewKeys.has(prKey(pr)) && !myPRKeys.has(prKey(pr)),
       )
 
       // Stacks are an overlay: without them the dashboard still shows every PR, so a failure here
       // is reported next to the PRs instead of replacing them.
-      const numbers = [...reviewRequested, ...dedupedReviewedByMe, ...authoredPRs].map((pr) => pr.number)
-      let stackIndex: StackIndex = new Map()
-      let stackFailure = ""
-      try {
-        stackIndex = await fetchStacks(numbers)
-      } catch (e) {
-        stackFailure = e instanceof Error ? e.message : String(e)
-      }
+      const listed = [...reviewRequested, ...dedupedReviewedByMe, ...authoredPRs]
+      const stackResults = await Promise.allSettled(
+        REPOS.map((r) => fetchStacks(r.name, listed.filter((pr) => pr.repo === r.name).map((pr) => pr.number))),
+      )
+      const stackIndex: StackIndex = new Map()
+      const stackFailures: string[] = []
+      stackResults.forEach((result, i) => {
+        if (result.status === "fulfilled") {
+          for (const [key, stack] of result.value) stackIndex.set(key, stack)
+          return
+        }
+        const message = result.reason instanceof Error ? result.reason.message : String(result.reason)
+        stackFailures.push(REPOS.length > 1 ? `${REPOS.at(i)?.label ?? "?"}: ${message}` : message)
+      })
 
       batch(() => {
         setPrs(authoredPRs)
         setNeedsMyReview(reviewRequested)
         setReviewedByMe(dedupedReviewedByMe)
         setStacks(stackIndex)
-        setStackSlots((prev) => assignStackSlots(prev, [...stackIndex.values()].map((s) => s.number)))
-        setStackError(stackFailure)
+        setStackSlots((prev) => assignStackSlots(prev, stackIndex.values()))
+        setStackError(stackFailures.join("; "))
         setLastRefresh(new Date().toLocaleTimeString())
         setLoading(false)
       })
@@ -877,14 +931,16 @@ function App() {
   const rows = createMemo(() => buildRows(view(), data(), stacks()))
   const selectable = createMemo(() => prRows(rows()))
   const selected = createMemo(() => effectiveSelection(rows(), selection(), lastIndex(), stacks()))
+  const numberWidth = createMemo(() => Math.max(0, ...selectable().map((r) => `#${r.number}`.length)))
 
   const ctx: RowContext = {
     view,
     selected,
     slot: (stack) => {
-      const slot = stackSlots().get(stack.number) ?? 0
+      const slot = stackSlots().get(stackKey(stack)) ?? 0
       return { letter: slotLetter(slot), color: theme.stacks[slot % theme.stacks.length] ?? theme.dimmed }
     },
+    numberWidth,
   }
 
   const totalPRs = createMemo(() => prs().filter((pr) => pr.status !== "merged").length)
@@ -902,7 +958,7 @@ function App() {
     const next = list[nextIndex]
     if (!next) return
     batch(() => {
-      setSelection({ section: next.section, number: next.number })
+      setSelection({ section: next.section, repo: next.repo, number: next.number })
       setLastIndex(nextIndex)
     })
   }
@@ -928,7 +984,7 @@ function App() {
     if (key.name === "o") {
       const row = selected()
       if (row) {
-        Bun.spawn(["gh", "pr", "view", "--repo", REPO, "--web", String(row.number)], {
+        Bun.spawn(["gh", "pr", "view", "--repo", row.repo, "--web", String(row.number)], {
           stdout: "ignore",
           stderr: "ignore",
         })

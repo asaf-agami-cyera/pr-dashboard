@@ -14,7 +14,19 @@ export interface ReviewInfo {
   submittedAt: string
 }
 
+/** A PR's identity: numbers are only unique within one repository. */
+export interface PRRef {
+  /** `owner/name` */
+  repo: string
+  number: number
+}
+
+export function prKey(ref: PRRef): string {
+  return `${ref.repo}#${ref.number}`
+}
+
 export interface PR {
+  repo: string
   number: number
   title: string
   url: string
@@ -28,6 +40,7 @@ export interface PR {
 }
 
 export interface ReviewerPR {
+  repo: string
   number: number
   title: string
   url: string
