@@ -116,7 +116,7 @@ function summary(notifications: PRNotification[]): PRNotification {
   }
 }
 
-/** Posts through terminal-notifier; it stays on screen only if its macOS alert style is "Alerts". */
+/** Posts through terminal-notifier; it stays on screen only if its macOS Alert Style is "Persistent". */
 export async function postNotification(n: PRNotification): Promise<void> {
   const proc = Bun.spawn(
     [

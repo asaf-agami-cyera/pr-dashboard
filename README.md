@@ -31,4 +31,4 @@ bun run start -- --repo octo-org/api --repo acme/web-app=web --self-login github
 
 While the dashboard runs, it posts a macOS notification when one of your PRs gets a new review or is merged, or when someone requests your review. Clicking one opens the PR.
 
-Install `brew install terminal-notifier`. To keep notifications on screen until you dismiss them, set terminal-notifier's style to **Alerts** in System Settings → Notifications. Nothing is posted for the first load or for failed refreshes.
+Install `brew install terminal-notifier`. To keep notifications on screen until you dismiss them, set terminal-notifier's Alert Style to **Persistent** in System Settings → Notifications. Nothing is posted for the first load or for failed refreshes.
