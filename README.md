@@ -26,3 +26,9 @@ Track several repositories by separating them with commas, or by repeating `--re
 PR_DASHBOARD_REPO="octo-org/api,acme/web-app=web" bun run start
 bun run start -- --repo octo-org/api --repo acme/web-app=web --self-login github-login
 ```
+
+### Desktop notifications
+
+While the dashboard runs, it posts a macOS notification when one of your PRs gets a new review or is merged, or when someone requests your review. Clicking one opens the PR.
+
+Install `brew install terminal-notifier`. To keep notifications on screen until you dismiss them, set terminal-notifier's style to **Alerts** in System Settings → Notifications. Nothing is posted for the first load or for failed refreshes.

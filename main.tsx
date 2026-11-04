@@ -3,6 +3,7 @@ import { render, useKeyboard, useRenderer } from "@opentui/solid"
 import { createSignal, createMemo, For, Show, onCleanup, batch } from "solid-js"
 import type { CIStatus, PR, PRStatus, ReviewInfo, ReviewerPR } from "./model"
 import { prKey } from "./model"
+import { postNotification, trackChanges, type Seen, type Snapshot } from "./notifications"
 import { mergedSearch, recentMerges } from "./recent-merges"
 import { parseRepos, type RepoConfig } from "./repos"
 import {
@@ -862,8 +863,24 @@ function App() {
   const [view, setView] = createSignal<View>("status")
   const [selection, setSelection] = createSignal<Selection | undefined>()
   const [lastIndex, setLastIndex] = createSignal(0)
+  const [notifyError, setNotifyError] = createSignal(
+    Bun.which("terminal-notifier") ? "" : "terminal-notifier not found (brew install terminal-notifier)",
+  )
+  // Only successful refreshes reach this, so a failed `gh` call can't look like a change.
+  let seen: Seen | undefined
+  let refreshRun = 0
+
+  function notifyChanges(next: Snapshot) {
+    const result = trackChanges(seen, next, (repo) => REPO_LABELS.get(repo) ?? repo)
+    seen = result.seen
+    if (notifyError()) return
+    for (const n of result.notifications) {
+      postNotification(n).catch((e) => setNotifyError(e instanceof Error ? e.message : String(e)))
+    }
+  }
 
   async function refresh() {
+    const run = ++refreshRun
     setLoading(true)
     setError("")
     try {
@@ -915,6 +932,9 @@ function App() {
         setLastRefresh(new Date().toLocaleTimeString())
         setLoading(false)
       })
+      // An overlapping refresh (`r` during the timer's) may finish out of order; older data would
+      // roll the seen state back and repeat its notifications on the next refresh.
+      if (run === refreshRun) notifyChanges({ mine: authoredPRs, needsReview: reviewRequested, reviewedByMe: reviewedBy })
     } catch (e) {
       batch(() => {
         setError(e instanceof Error ? e.message : String(e))
@@ -1023,6 +1043,10 @@ function App() {
 
       <Show when={stackError()}>
         <ErrorBanner label="Stacks unavailable:" message={stackError()} />
+      </Show>
+
+      <Show when={notifyError()}>
+        <ErrorBanner label="Desktop notifications off:" message={notifyError()} />
       </Show>
 
       <Show when={!loading() && totalItems() === 0 && !error()}>
