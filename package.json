@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "bun main.tsx"
+    "start": "bun main.tsx",
+    "build-notifiers": "bun scripts/build-notifiers.ts"
   },
   "dependencies": {
     "@opentui/core": "latest",

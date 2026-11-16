@@ -1,0 +1,10 @@
+{
+  "glyphScale": 0.56,
+  "foreground": "#ffffff",
+  "notifiers": {
+    "approved": { "name": "PR Approved", "icon": "octicons/check", "background": "#1f883d" },
+    "merged": { "name": "PR Merged", "icon": "octicons/git-merge", "background": "#8250df" },
+    "review_requested": { "name": "PR Review Requested", "icon": "octicons/question", "background": "#0969da" },
+    "attention": { "name": "PR Activity", "icon": "octicons/alert", "background": "#bc4c00" }
+  }
+}
