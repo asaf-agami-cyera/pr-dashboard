@@ -1,5 +1,7 @@
+import { existsSync } from "node:fs"
 import type { PR, PRStatus, ReviewerPR } from "./model"
 import { prKey } from "./model"
+import { notifierBinary, type NotifierKind } from "./notifiers"
 
 /** What one successful refresh saw. */
 export interface Snapshot {
@@ -24,6 +26,8 @@ export interface PRNotification {
   subtitle: string
   message: string
   url: string
+  /** Picks the notifier app, and so the icon. */
+  kind: NotifierKind
 }
 
 const statusTitles: Partial<Record<PRStatus, string>> = {
@@ -80,12 +84,15 @@ export function trackChanges(
 
     const statusTitle = merged ? "Merged" : pr.status !== before.status ? statusTitles[pr.status] : undefined
     const reviewers = newReviews.map((r) => `${r.login} ${reviewVerbs[r.state] ?? r.state.toLowerCase()}`)
+    const approving = newReviews.length > 0 && newReviews.every((r) => r.state === "APPROVED")
+    const kind: NotifierKind = merged ? "merged" : (statusTitle && pr.status === "approved") || approving ? "approved" : "attention"
     notifications.push({
       group: `mine:${prKey(pr)}`,
       title: statusTitle ?? "New review",
       subtitle: [ref(pr), ...reviewers].join(" · "),
       message: pr.title,
       url: pr.url,
+      kind,
     })
   }
 
@@ -97,6 +104,7 @@ export function trackChanges(
       subtitle: `${ref(pr)} · by ${pr.author}`,
       message: pr.title,
       url: pr.url,
+      kind: "review_requested",
     })
   }
 
@@ -113,14 +121,20 @@ function summary(notifications: PRNotification[]): PRNotification {
     subtitle: [...new Set(notifications.map((n) => n.title))].join(", "),
     message: "See the PR dashboard",
     url: "https://github.com/pulls",
+    kind: "attention",
   }
 }
 
-/** Posts through terminal-notifier; it stays on screen only if its macOS Alert Style is "Persistent". */
+/**
+ * Posts through this kind's terminal-notifier copy so the notification gets the kind's icon, or
+ * through plain terminal-notifier if `bun run build-notifiers` hasn't installed the copies. Each
+ * copy stays on screen only if its macOS Alert Style is "Persistent".
+ */
 export async function postNotification(n: PRNotification): Promise<void> {
+  const notifier = existsSync(notifierBinary(n.kind)) ? notifierBinary(n.kind) : "terminal-notifier"
   const proc = Bun.spawn(
     [
-      "terminal-notifier",
+      notifier,
       "-title", n.title,
       "-subtitle", n.subtitle,
       // terminal-notifier misreads a message that starts with "[" unless it is escaped.
@@ -131,5 +145,5 @@ export async function postNotification(n: PRNotification): Promise<void> {
     { stdout: "ignore", stderr: "pipe" },
   )
   const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited])
-  if (exitCode !== 0) throw new Error(`terminal-notifier failed (exit ${exitCode}): ${stderr.trim()}`)
+  if (exitCode !== 0) throw new Error(`${notifier} failed (exit ${exitCode}): ${stderr.trim()}`)
 }

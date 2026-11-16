@@ -4,6 +4,7 @@ import { createSignal, createMemo, For, Show, onCleanup, batch } from "solid-js"
 import type { CIStatus, PR, PRStatus, ReviewInfo, ReviewerPR } from "./model"
 import { prKey } from "./model"
 import { postNotification, trackChanges, type Seen, type Snapshot } from "./notifications"
+import { missingNotifiers } from "./notifiers"
 import { mergedSearch, recentMerges } from "./recent-merges"
 import { parseRepos, type RepoConfig } from "./repos"
 import {
@@ -866,6 +867,8 @@ function App() {
   const [notifyError, setNotifyError] = createSignal(
     Bun.which("terminal-notifier") ? "" : "terminal-notifier not found (brew install terminal-notifier)",
   )
+  const missingIcons = missingNotifiers()
+  const iconsError = missingIcons.length > 0 ? `${missingIcons.join(", ")} not installed (bun run build-notifiers)` : ""
   // Only successful refreshes reach this, so a failed `gh` call can't look like a change.
   let seen: Seen | undefined
   let refreshRun = 0
@@ -1047,6 +1050,10 @@ function App() {
 
       <Show when={notifyError()}>
         <ErrorBanner label="Desktop notifications off:" message={notifyError()} />
+      </Show>
+
+      <Show when={!notifyError() && iconsError}>
+        <ErrorBanner label="Notification icons off:" message={iconsError} />
       </Show>
 
       <Show when={!loading() && totalItems() === 0 && !error()}>

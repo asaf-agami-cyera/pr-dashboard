@@ -64,6 +64,7 @@ describe("trackChanges", () => {
         subtitle: "api#1 · alice approved",
         message: "Add retries",
         url: "https://github.com/acme/api/pull/1",
+        kind: "approved",
       },
     ])
   })
@@ -123,6 +124,7 @@ describe("trackChanges", () => {
         subtitle: "api#7 · by bob",
         message: "Fix login",
         url: "https://github.com/acme/api/pull/7",
+        kind: "review_requested",
       },
     ])
     expect(third).toEqual([])
@@ -141,5 +143,36 @@ describe("trackChanges", () => {
     const requests = Array.from({ length: 6 }, (_, i) => other({ number: i + 10 }))
     const [, notifications] = run({}, { needsReview: requests })
     expect(notifications.map((n) => [n.title, n.subtitle])).toEqual([["6 PR updates", "Review requested"]])
+  })
+
+  test("each notification picks the icon for what happened", () => {
+    const comment = review("carol", "COMMENTED", "2026-11-02T00:00:00Z")
+    const changes = review("carol", "CHANGES_REQUESTED", "2026-11-02T00:00:00Z")
+    const secondApproval = review("dave", "APPROVED", "2026-11-03T00:00:00Z")
+    const [, notifications] = run(
+      { mine: [mine(), mine({ number: 2 }), mine({ number: 3, status: "approved", humanReviews: [alice] }), mine({ number: 4, status: "approved" })] },
+      {
+        mine: [
+          mine({ status: "reviewed", humanReviews: [comment] }),
+          mine({ number: 2, status: "changes_requested", humanReviews: [changes] }),
+          mine({ number: 3, status: "approved", humanReviews: [alice, secondApproval] }),
+          mine({ number: 4, status: "merged" }),
+        ],
+        needsReview: [other()],
+      },
+    )
+    expect(notifications.map((n) => [n.title, n.kind])).toEqual([
+      ["Reviewed", "attention"],
+      ["Changes requested", "attention"],
+      ["New review", "approved"],
+      ["Merged", "merged"],
+      ["Review requested", "review_requested"],
+    ])
+  })
+
+  test("the summary uses the attention icon", () => {
+    const requests = Array.from({ length: 6 }, (_, i) => other({ number: i + 10 }))
+    const [, notifications] = run({}, { needsReview: requests })
+    expect(notifications.map((n) => n.kind)).toEqual(["attention"])
   })
 })
