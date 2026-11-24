@@ -325,7 +325,7 @@ async function fetchReviewerPRs(repo: string, search: string, includeMyReviewSta
   return parseReviewerPRs(repo, raw, { includeMyReviewState })
 }
 
-const fetchReviewRequestedPRs = (repo: string) => fetchReviewerPRs(repo, "review-requested:@me", false)
+const fetchReviewRequestedPRs = (repo: string) => fetchReviewerPRs(repo, "user-review-requested:@me", false)
 const fetchReviewedByMePRs = (repo: string) => fetchReviewerPRs(repo, "reviewed-by:@me", true)
 
 // `gh pr list --json` has no stack fields, so stack membership comes from GraphQL.
